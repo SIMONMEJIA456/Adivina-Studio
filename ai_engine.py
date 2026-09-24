@@ -15,11 +15,20 @@ respaldo ("modo offline") para que el prototipo siga siendo usable
 en una demo sin conexión ni credenciales.
 """
 
+import logging
 import os
 import requests
 
+log = logging.getLogger("ghostie")
+
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama3-70b-8192"
+# El modelo se puede cambiar sin tocar el código: export GROQ_MODEL=...
+# (llama3-70b-8192 fue retirado por Groq en agosto de 2025 y
+# llama-3.3-70b-versatile en agosto de 2026; ver console.groq.com/docs/deprecations)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+# Último error de la API (para depurar; la app no se lo muestra al estudiante).
+ULTIMO_ERROR: str | None = None
 
 SYSTEM_PROMPT = """Eres "Ghostie", el asistente virtual fantasma de la app \
 educativa Adivina_Estudio, dirigida a estudiantes menores de edad.
@@ -97,11 +106,17 @@ def responder_socratico(mensaje_usuario: str, materia: str, historial=None,
     if not api_key:
         return GhostieOffline().responder(mensaje_usuario, materia, historial)
 
+    global ULTIMO_ERROR
+    ULTIMO_ERROR = None
+
     payload = {
         "model": GROQ_MODEL,
         "messages": _construir_mensajes(materia, historial, mensaje_usuario),
         "temperature": 0.6,
-        "max_tokens": 400,
+        # gpt-oss es un modelo de razonamiento: parte de los tokens se gasta
+        # "pensando". Con un tope bajo podía devolver el texto vacío.
+        "max_completion_tokens": 1024,
+        "reasoning_effort": "low",
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -109,10 +124,20 @@ def responder_socratico(mensaje_usuario: str, materia: str, historial=None,
     }
 
     try:
-        resp = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=20)
-        resp.raise_for_status()
+        resp = requests.post(GROQ_API_URL, json=payload, headers=headers, timeout=30)
+        if not resp.ok:
+            # Groq explica el motivo en el cuerpo (modelo retirado, clave
+            # inválida, límite de uso...). Antes este detalle se perdía.
+            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        # Cualquier error de red/API cae a modo offline en vez de romper la demo.
+        texto = (data["choices"][0]["message"].get("content") or "").strip()
+        if not texto:
+            raise RuntimeError("La API respondió sin texto")
+        return texto
+    except Exception as exc:
+        # Cualquier error de red/API cae a modo offline en vez de romper la demo,
+        # pero ahora queda registrado en la terminal.
+        ULTIMO_ERROR = str(exc)
+        log.warning("Groq falló, usando modo offline: %s", exc)
+        print(f"[ghostie] Groq falló, usando modo offline: {exc}")
         return GhostieOffline().responder(mensaje_usuario, materia, historial)
